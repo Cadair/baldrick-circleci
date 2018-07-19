@@ -1,19 +1,30 @@
 import json
-import requests
-from changebot.github.github_auth import github_request_headers, repo_to_installationid_mapping
+
+from baldrick.github.github_auth import repo_to_installationid_mapping
+from baldrick.github.github_api import RepoHandler
 
 from flask import Blueprint, request
 
 circleci = Blueprint('circleci', __name__)
 
 
-HOST = "https://api.github.com"
+CIRCLECI_HANDLERS = []
+
+
+def circleci_webhook_handler(func):
+    """
+    Add a function that gets called when a circleci webhook is received.
+
+    The functions decorated with this decorator will be called with
+    ``(repo_handler, payload)``. Nothing will be done with the return values.
+    """
+
+    CIRCLECI_HANDLERS.append(func)
+    return func
 
 
 @circleci.route('/circleci', methods=['POST'])
 def circleci_handler():
-    # Get installation id
-    repos = repo_to_installationid_mapping()
 
     if not request.data:
         print("No payload received")
@@ -30,71 +41,14 @@ def circleci_handler():
     if not required_keys.issubset(payload.keys()):
         return 'Payload missing {}'.format(' '.join(required_keys - payload.keys()))
 
-    if payload['status'] == 'success':
-        artifacts = get_artifacts_from_build(payload)
-        url = get_documentation_url_from_artifacts(artifacts)
+    # Get installation id
+    repos = repo_to_installationid_mapping()
+    repo = f"{payload['username']}/{payload['reponame']}"
 
-        if url:
-            repo = f"{payload['username']}/{payload['reponame']}"
-            if repo in repos:
-                set_commit_status(repo, repos[repo],
-                                  payload['vcs_revision'], "success",
-                                  "Click details to preview the documentation build", url)
+    if repo not in repos:
+        return f"circleci: Not installed for {repo}"
 
-    return "All good"
+    repo_handler = RepoHandler(repo, branch="master", installation=repos[repo])
 
-
-def get_artifacts_from_build(p):
-    base_url = "https://circleci.com/api/v1.1"
-    query_url = f"{base_url}/project/github/{p['username']}/{p['reponame']}/{p['build_num']}/artifacts"
-    response = requests.get(query_url)
-    assert response.ok, response.content
-    return response.json()
-
-
-def get_documentation_url_from_artifacts(artifacts):
-    for artifact in artifacts:
-        # Find the root sphinx index.html
-        if "html/index.html" in artifact['path']:
-            return artifact['url']
-
-
-def set_commit_status(repository, installation, commit_hash, state, description, target_url):
-
-    headers = github_request_headers(installation)
-
-    set_status(repository, commit_hash, state, description, "giles-dev",
-               headers=headers, target_url=target_url)
-
-
-def set_status(repository, commit_hash, state, description, context, *, headers, target_url=None):
-    """
-    Set status message in a pull request on GitHub.
-
-    Parameters
-    ----------
-    state : { 'pending' | 'success' | 'error' | 'failure' }
-        The state to set for the pull request.
-
-    description : str
-        The message that appears in the status line.
-
-    context : str
-        A string used to identify the status line.
-
-    target_url : str or `None`
-        Link to bot comment that is relevant to this status, if given.
-
-    """
-
-    data = {}
-    data['state'] = state
-    data['description'] = description
-    data['context'] = context
-
-    if target_url is not None:
-        data['target_url'] = target_url
-
-    url = f'{HOST}/repos/{repository}/statuses/{commit_hash}'
-    response = requests.post(url, json=data, headers=headers)
-    assert response.ok, response.content
+    for handler in CIRCLECI_HANDLERS:
+        handler(repo_handler, payload)
